@@ -1,0 +1,1097 @@
+#include <Wiegand.h>
+#include <string.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Ethernet.h>
+#include <sha1.h>
+#include <ArduinoJson.h>
+#include <NTPClient.h>
+#include <time.h>
+
+// These are the pins connected to the Wiegand D0 and D1 signals.
+// Ensure your board supports external Interruptions on these pins
+#define PIN_D0 3    // D0 Wiegand pin
+#define PIN_D1 2    // D1 Wiegand pin
+
+#define PIN_T A1     // Pin connected to relay.
+#define PIN_BUTT A0  // Pin connected to buttonM
+#define PIN_LED 5   // Pin connected to led
+#define PIN_SPK 6   // Pin connected to spk
+
+#define OPEN 10     // Why this numbers ???
+#define CLOSED 11   // Why this numbers ???
+
+#define SPK_DELAY 200   // Duration of speaker sound
+#define ECHO_DELAY 600  // Count of loop cycles before sending echo
+
+#define KEYCOUNT 6      // Count of keys in key sequence
+
+//#define VERBOSE
+
+//----------Network settings----------
+byte mac[] = {0x90, 0xA2, 0xDA, 0xFF, 0xFF, 0xA2};  // NIC mac
+char* remoteServer = "172.18.198.31";               // Server IP
+int port = 8000;                                    // Server port
+
+// Настройки брокера
+const char *mqtt_server = "172.18.198.31";
+const int mqtt_port = 1883;
+const char *mqtt_user = "guest";
+const char *mqtt_password = "guest";
+const char *mqtt_topic = "local.mqtt";
+
+Wiegand wiegand;        // The object that handles the wiegand protocol
+EthernetClient client;  // The object that handles the ethernet
+EthernetClient ETHclient;
+EthernetServer server(8000);
+EthernetClient srvClient;
+PubSubClient MQTTclient(ETHclient);
+EthernetUDP UDP;
+NTPClient timeClient(UDP, "213.141.154.170", 10800);
+//----------Global variables----------
+char* lockID = "908581ce-7860-11ec-90d6-0242ac120003";      // Lock ID
+char* masterKey = "5962813a-2b27-422f-8ad8-84b5fd34ca8f";   // Master Key
+char* versionSW = "1.20";               // Version of software
+char* versionAPI = "1";                 // Version of lock API on backend
+bool lockState = 0;                     // Variable to set HIGH or LOW to PIN
+bool access = 0;                        // Access flag for shitcode in answer from server check
+bool connection_status = false;         // Connection status
+bool buttonActive = false;              // Variable to save button state
+bool longPressActive = false;           // Variable to save unlock mode state
+unsigned long buttonTimer = 0;          // Variable to save start of pushing button
+unsigned long last_switch = 0;          // Variable to save time of last switch
+unsigned long longPressTime = 2000;     // Variable to save duration of long press
+unsigned int systemState = CLOSED;      // Variable to save state of door
+unsigned long doorOpenDuration = 3000;  // Variable to save door open time
+unsigned int counter = 0;               // Counter of loop for sending echo
+char keySequence[KEYCOUNT+1];           // Readed keys from numpad
+unsigned int keyCounter = 0;            // Count of readed keys from numpad
+char* logFilename = "log.log";          // Log filename
+File logFile;                           // Log file
+long lastReconnectAttempt = 0;
+
+void callback(char* topic, char* payload, unsigned int length)
+{ boolean flag = false;
+  //--------------------------------------------------------------------------------------
+  Serial.println(String(topic));
+  if (String(topic) == "mqtt-subscription-Arduinoqos1")
+  {
+    Serial.println((char)payload[0]);
+    if ((char)payload[0] == '*') flag = true;
+    if ((char)payload[0] == '#') flag = false;
+    digitalWrite(PIN_T, flag);
+  }
+}
+boolean reconnect() {
+  // Loop until we're reconnected
+  while (!MQTTclient.connected()) {
+    Serial.println("Connecting to MQTT broker...");
+    // Attempt to connect
+    if (MQTTclient.connect("Arduino", mqtt_user, mqtt_password)) {
+      Serial.println("connected");
+        //Подписка на топик
+      MQTTclient.subscribe(mqtt_topic, 1);
+    } else {
+      Serial.print(F("failed, rc="));
+      Serial.print(MQTTclient.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+  return MQTTclient.connected();
+}
+
+void monitor_MQTT()
+{
+  if (!MQTTclient.connected()) {
+    long now = millis();
+    if (now - lastReconnectAttempt > 5000) {
+      lastReconnectAttempt = now;
+      // Attempt to reconnect
+      if (reconnect()) {
+        lastReconnectAttempt = 0;
+      }
+    }
+  } else {
+    // Client connected
+
+    MQTTclient.loop();
+  }
+}
+
+// Master cards, do not require network connection to open the lock
+char* mastercards[10];
+int cardSize = 0;
+void setMasterCards() {
+    mastercards[cardSize++] = "0E72B8"; // Денис Александрович Королев
+    mastercards[cardSize++] = "2079FA"; // Петр Владимирович Рыбаков
+    mastercards[cardSize++] = "146DBF"; // Першуков Никита Игоревич
+    mastercards[cardSize++] = "98B319"; // Матвеев Данил
+    mastercards[cardSize++] = "28ABF8"; // Security
+    mastercards[cardSize++] = "70FE1E"; // Cleaner
+    mastercards[cardSize++] = "7B563C"; // Cleaner
+    mastercards[cardSize++] = "5BECE5"; // Диспетчер
+    mastercards[cardSize++] = "9891A7"; // Илья
+}
+char* masterKeySequence = "1234";     // Master key to open lock with numpad
+
+
+/*
+* @brief Get ISO formatted time from NTP client
+*
+* Get ISO formatted time from NTP client
+*
+* @param timeClient - NTP client pointer
+*
+* @return char with time
+*/
+char* getISOFormattedTime(NTPClient* timeClient) {
+// AVR implementation of localtime() uses midn. Jan 1 2000 as epoch
+// so UNIX_OFFSET has to be applied to time returned by getEpochTime()
+// More info here: https://www.nongnu.org/avr-libc/user-manual/group__avr__time.html
+// https://forum.arduino.cc/index.php?topic=567637.0
+    timeClient->update();
+    time_t rawtime = timeClient->getEpochTime() - UNIX_OFFSET;
+    struct tm *ti;
+    static char buf[] = "0000-00-00T00:00:00Z";
+    ti = localtime (&rawtime);
+    //Serial.println(timeClient->getEpochTime());
+    if (strftime(buf, sizeof buf, "%FT%TZ", ti)) {
+        // Serial.print("Succsessfully formatted: ");
+        //Serial.println(buf);
+    } else {
+        //Serial.println("strftime failed");
+    }
+    //buf[strlen(buf)-1] = '\0';
+    return buf;
+}
+
+/*
+* @brief Print line to file and serial
+*
+* If logFile then print data to file;
+* If serial then print data to serial without VERBOSE;
+*
+* @param message - string/char/int/char* with data
+* @param serial=0 - bool for print to serial without VERBOSE
+*
+* @return none
+*/
+void printData(char* message, bool serial = 0) {
+    if (logFile) {
+        logFile.print(message);
+        if (message[strlen(message)-1] == '\n') {
+            logFile.print(getISOFormattedTime(&timeClient));
+            logFile.print('\n');
+        }
+    }
+    if (serial)
+        Serial.print(message);
+    else {
+#ifdef VERBOSE
+        Serial.print(message);
+#endif
+    }
+}
+
+void printData(char message, bool serial = 0) {
+    if (logFile)
+        logFile.print(message);
+    if (serial)
+        Serial.print(message);
+    else {
+#ifdef VERBOSE
+        Serial.print(message);
+#endif
+    }
+}
+
+void printData(int message, bool serial = 0) {
+    if (logFile)
+        logFile.print(message);
+    if (serial)
+        Serial.print(message);
+    else {
+#ifdef VERBOSE
+        Serial.print(message);
+#endif
+    }
+}
+
+void printData(String message, bool serial = 0) {
+    if (logFile)
+        logFile.print(message);
+    if (serial)
+        Serial.print(message);
+    else {
+#ifdef VERBOSE
+        Serial.print(message);
+#endif
+    }
+}
+
+void printData(IPAddress message, bool serial = 0) {
+    if (logFile)
+        logFile.print(message);
+    if (serial)
+        Serial.print(message);
+    else {
+#ifdef VERBOSE
+        Serial.print(message);
+#endif
+    }
+}
+
+/*
+* @brief Close and open log file
+*
+* Close and open log file
+*
+* @return none
+*/
+void reopenLog() {
+    if (logFile)
+        logFile.close();
+    logFile = SD.open(logFilename, FILE_WRITE);
+}
+
+/*
+* @brief Try to connect to remote backend server
+*
+* If connection is success, then connection_status is true, else false
+*
+* @return none
+*/
+void testConnection2Server() {
+    // Test network connection
+    if (client.connect(remoteServer, port)) { // Connection successful
+        if (! connection_status)
+            printData("Get server connection\n", 1);
+            Serial.print("Get server connection\n");
+        connection_status = true;
+    } else {                              // Connection failed
+        if (connection_status)
+            printData("No server connection\n", 1);
+        connection_status = false;
+        client.stop();
+    }
+}
+
+/*
+* @brief Sending lockID to server
+*
+* POST request to backend server with lockID, masterKey & versionSW
+*
+* @return none
+*/
+void sendLockID2Server() {
+    String data = "{\"uuid\":\"";
+    data.concat(lockID);
+    data.concat("\",\"master\":\"");
+    data.concat(masterKey);
+    data.concat("\",\"version\":\"");
+    data.concat(versionSW);
+    data.concat("\"}");
+    client.flush();
+    client.print("POST /lock-api/v");
+    client.print(versionAPI);
+    client.println("/register-lock/ HTTP/1.1");
+    client.print("Host: ");
+    client.println(remoteServer);
+    client.println("Content-Type: application/json");
+    client.println("Connection:close");
+    client.print("Content-Length:");
+    client.println(data.length());
+    client.println();
+    client.print(data);
+    client.flush();
+}
+
+/*
+* @brief Change lock state
+*
+* Change lock state with led and beep signals
+*
+* @return none
+*/
+void changeLockState(int newSystemState = 0) {
+    switch (newSystemState) {
+        case CLOSED :
+            systemState = CLOSED;   // Set close mode
+            lockState = LOW;
+            digitalWrite(PIN_T, lockState);
+            printData("Closed mode ON\n", 1);
+            digitalWrite(PIN_LED, LOW);
+            digitalWrite(PIN_SPK, LOW);
+            delay(SPK_DELAY);
+            digitalWrite(PIN_SPK, HIGH);
+            break;
+        case OPEN :
+            systemState = OPEN;     // Set open mode
+            lockState = HIGH;
+            digitalWrite(PIN_T, lockState);
+            printData("Open mode ON\n", 1);
+            digitalWrite(PIN_LED, HIGH);
+            digitalWrite(PIN_SPK, LOW);
+            delay(SPK_DELAY);
+            digitalWrite(PIN_SPK, HIGH);
+            break;
+        default :
+            if (systemState == CLOSED) {
+                systemState = OPEN;     // Set open mode
+                lockState = HIGH;
+                digitalWrite(PIN_T, lockState);
+                printData("Open mode ON\n", 1);
+                digitalWrite(PIN_LED, HIGH);
+                digitalWrite(PIN_SPK, LOW);
+                delay(SPK_DELAY);
+                digitalWrite(PIN_SPK, HIGH);
+            } else {
+                systemState = CLOSED;   // Set close mode
+                lockState = LOW;
+                digitalWrite(PIN_T, lockState);
+                printData("Closed mode ON\n", 1);
+                digitalWrite(PIN_LED, LOW);
+                digitalWrite(PIN_SPK, LOW);
+                delay(SPK_DELAY);
+                digitalWrite(PIN_SPK, HIGH);
+            }
+            break;
+    }
+}
+
+
+/*
+* @brief Processing button pressing
+*
+* If button is pressed shortly, open lock;
+* If button is pressed longly, call changeLockState;
+*
+* @return none
+*/
+void buttonProcessing() {
+    if (!digitalRead(PIN_BUTT)) {
+        if (buttonActive == false) {
+            buttonActive = true;
+            buttonTimer = millis();     // Save time when button is pressed
+        }
+        if ((millis() - buttonTimer > longPressTime) && (longPressActive == false)) {
+            longPressActive = true;     // If it's long press
+            printData("Long press detected, switching mode\n");
+            changeLockState();
+        }
+    } else {                            // If it's not long press
+        if (buttonActive == true) {
+            if (longPressActive == true) {
+                longPressActive = false;// It's not long press
+            } else if (systemState == CLOSED) {
+                lockState = HIGH;        // Unlock door by button
+                digitalWrite(PIN_T, lockState);
+                printData("Door unlocked by button\n", 1);
+                last_switch = millis();
+                digitalWrite(PIN_LED, HIGH);
+                digitalWrite(PIN_SPK, LOW);
+                delay(SPK_DELAY);
+                digitalWrite(PIN_SPK, HIGH);
+            }
+            buttonActive = false;
+        }
+    }
+}
+
+
+
+/*
+* @brief Updating lock state
+*
+* If duration > 0 then open lock;
+* If duration = 0 or not set then check time after door may be opened;
+* If beep then beep;
+* If led then led;
+*
+* @param duration - duration for opening lock, default 0
+* @param beep - is beep signal is needed, default 1
+* @param led - is led signal is needed, default 1
+*
+* @return none
+*/
+void updateLock(int duration = 0, bool beep = 1, bool led = 1) {
+    if (duration) {
+        if (systemState == CLOSED) {
+            printData("Open lock for ");
+            printData(duration);
+            printData(" seconds\n");
+            lockState = HIGH;
+            digitalWrite(PIN_T, lockState);
+            last_switch = millis();
+            if (led)
+                digitalWrite(PIN_LED, HIGH);
+            if (beep) {
+                digitalWrite(PIN_SPK, LOW);
+                delay(SPK_DELAY);
+                digitalWrite(PIN_SPK, HIGH);
+            }
+        } else {
+            printData("Door already open\n");
+        }
+    } else {
+        if (systemState == CLOSED) {            // If door neccessary to be closed
+            if (millis() - last_switch > doorOpenDuration && lockState == HIGH) {
+                lockState = LOW;               // and time from last switch is more
+                digitalWrite(PIN_T, lockState); // than door open time
+                if (led)
+                    digitalWrite(PIN_LED, LOW);
+                if (beep)
+                    digitalWrite(PIN_SPK, HIGH);
+                printData("Door locked\n");  // then close the door
+            }
+        }
+    }
+}
+
+
+
+/*
+* @brief Open lock
+*
+* Open lock for duration or doorOpenDuration, calling updateLock;
+*
+* @param duration - duration for opening lock, default doorOpenDuration
+* @param beep - is beep signal is needed, default 1
+* @param led - is led signal is needed, default 1
+*
+* @return none
+*/
+void openLock(int duration = doorOpenDuration, bool beep = 1, bool led = 1) {
+    updateLock(duration, beep, led);
+}
+
+/*
+* @brief String to integer
+*
+* Convert string to integer to compare in switch
+*
+* @param str - input string
+* @param h - from which symbol start
+*
+* @return output converted integer
+*/
+constexpr unsigned int str2int(const char* str, int h = 0)
+{
+    return !str[h] ? 5381 : (str2int(str, h+1) * 33) ^ str[h];
+}
+
+/*
+* @brief Check command from server
+*
+* Check command which is send from backend server and send web answer
+*
+* @param command - command from server
+* @param key - master key from server
+*
+* @return none
+*/
+void checkServerCommand(char* command, char* key, char* params) {
+    if (strcmp(key,masterKey) == 0) {
+        switch (str2int(command)) {
+            case str2int("openLock") :
+                openLock();
+                printData("---Response-200---\n");
+                srvClient.println("HTTP/1.1 200 OK");
+                srvClient.println("Content-Type: text/html");
+                srvClient.println("Connection: close");
+                srvClient.println();
+                break;
+            case str2int("changeState") :
+                if (strlen(params))
+                    changeLockState((params[0]-'0')*10+params[1]-'0');
+                else
+                    changeLockState();
+                printData("---Response-200---\n");
+                srvClient.println("HTTP/1.1 200 OK");
+                srvClient.println("Content-Type: text/html");
+                srvClient.println("Connection: close");
+                srvClient.println();
+                srvClient.print(systemState);
+                break;
+            default :
+                printData("---Response-404---\n");
+                srvClient.println("HTTP/1.1 404 Not found");
+                srvClient.println("Content-Type: text/html");
+                srvClient.println("Connection: close");
+                srvClient.println();
+                srvClient.print("Error: command not found");
+        }
+    } else {
+        printData("---Response-404---\n");
+        srvClient.println("HTTP/1.1 404 Not found");
+        srvClient.println("Content-Type: text/html");
+        srvClient.println("Connection: close");
+        srvClient.println();
+        srvClient.print("Error: key not found");
+    }
+}
+
+/*
+* @brief Parse JSON from server
+*
+* Parse JSON with command which is send from backend server & call checkServerCommand
+*
+* @param str - JSON string from server
+*
+* @return none
+*/
+void parseJSONCommand(char* str) {
+//…an Ethernet connection
+//deserializeJson(doc, ethernetClient)
+    DynamicJsonDocument doc(256);
+    deserializeJson(doc, str);
+    printData("---Json-begin---\n");
+    printData(String(doc["command"].as<char*>()));
+    printData("\n");
+    printData(String(doc["key"].as<char*>()));
+    printData("\n");
+    printData("---Json-end--\n-");
+    checkServerCommand(doc["command"].as<char*>(), doc["key"].as<char*>(), doc["params"].as<char*>());
+}
+
+/*
+* @brief Read message from server
+*
+* Check if there's a message from backend server and call parseJSONCommand
+*
+* @return none
+*/
+void readMessage() {
+    if (connection_status) {    // If connected to a server
+        char str[256];
+        //memset(str, '\0', 256*sizeof(char));
+        int i = 0;
+        int messageBegin = 0;
+        srvClient = server.available();
+        boolean currentLineIsBlank = true;
+        while (srvClient.connected()) {
+            if (srvClient.available()) {
+                char c = srvClient.read();
+                printData(c, 1);
+                if (c == '\n') {
+                    // you're starting a new line
+                    if (currentLineIsBlank) {
+                        printData("---Start-message---\n");
+                        messageBegin = 1;
+                    } else
+                        currentLineIsBlank = true;
+                } else if (c != '\r') {
+                    // you've gotten a character on the current line
+                    currentLineIsBlank = false;
+                    if (messageBegin)
+                        str[i++] = c;
+                }
+            } else {
+                if (messageBegin) {
+                    str[i++] = '\0';
+                }
+                printData("\n");
+                printData("---Message-begin---\n");
+                printData(str);
+                printData("\n");
+                printData(int(strlen(str)));
+                printData("\n");
+                printData("---Message-end---\n");
+                parseJSONCommand(str);
+                break;
+            }
+        }
+        srvClient.stop();
+        srvClient.flush();
+    }
+}
+
+/*
+* @brief Send echo to server
+*
+* Send echo signal by GET request to backend server
+*
+* @return none
+*/
+void sendEcho2Server() {
+    if (connection_status) {    // If connected to a server
+        char str[30];
+        // Send GET request
+        printData("We connected\n");
+        client.print("GET /lock-api/v");
+        client.print(versionAPI);
+        client.print("/echo/");
+        client.print("?lock=");
+
+        // Get hash of lock ID
+        Sha1.init();
+        Sha1.print(lockID);
+        uint8_t* hash = Sha1.result();
+        char hashStr[40];
+        int k = 0;
+        for (int i = 0; i < 20; i++) {
+            sprintf(str, "%X", hash[i] >> 4);
+            hashStr[k++] = str[0];
+            sprintf(str, "%X", hash[i] & 0xF);
+            hashStr[k++] = str[0];
+        }
+        hashStr[40] = '\0';
+        client.print(hashStr);
+        client.println(" HTTP/1.1");
+        client.print("Host: ");
+        client.println(remoteServer);
+        client.println("Accept: */*");
+        client.println();
+        client.flush();
+        printData("We sent our stuff\n");
+    }
+}
+
+/*
+* @brief Initialize Wiegand reader
+*
+* Set frequency for serial output;
+* Disable microSD cardreader SPI;
+* Set pins for LED and SPK;
+* Set master cards;
+* Install listeners on wiegand reader and initialize it;
+* Set wiegand data pins as INPUT and attaches interruptions;
+* Set pin for relay;
+* Set pin for button;
+* Check for test params;
+* Test connection to backend server;
+* Send lock ID to backend server;
+* Send the initial pin state to the wiegand library;
+*
+* @return none
+*/
+void setup() {
+  // Поднятие Serial соединения
+  Serial.begin(9600);
+  Serial.println("Starting...");
+  delay(5000);
+  // Поднятие ethernet соединения
+  Serial.println("Connecting to Ethernet...");
+  Ethernet.begin(mac);
+//  while (!MQTTclient.connected()){
+//    MQTTclient.setServer(mqtt_server, mqtt_port);
+//    MQTTclient.setCallback(callback);
+//    MQTTclient.connect("Arduino", mqtt_user, mqtt_password);
+//  }
+//  if (MQTTclient.connected()) {
+//    Serial.println("Connected successfully");
+//    Serial.print("My IP address: ");
+//    Serial.println(Ethernet.localIP());
+//  }
+//  
+    // Disabling the Ethernet shield SD cardreader SPI
+    if (!SD.begin(4))
+        Serial.println("Card failed, or not present");
+    else
+        Serial.println("SD Card initialized");
+    reopenLog();
+    
+    server.begin();
+    if (logFile) {
+        logFile.println("Starting...");
+    } else {
+        Serial.print("error opening ");
+        Serial.println(logFilename);
+    }
+
+    // Set pins for LED and SPK
+    pinMode(PIN_LED, OUTPUT);
+    pinMode(PIN_SPK, OUTPUT);
+    digitalWrite(PIN_LED, HIGH);
+    digitalWrite(PIN_SPK, HIGH);
+
+    setMasterCards();
+
+    printData("FOSS Electronic lock controller v", 1);
+    printData(versionSW, 1);
+    printData("\n", 1);
+    printData("Initialization...\n", 1);
+    // Install listeners and initialize Wiegand reader
+    wiegand.onReceive(receivedData, "Card readed: ");
+    wiegand.onStateChange(stateChanged, "State changed: ");
+    wiegand.begin(Wiegand::LENGTH_ANY, true);
+
+    // Intialize pins as INPUT and attaches interruptions
+    pinMode(PIN_D0, INPUT);
+    pinMode(PIN_D1, INPUT);
+    attachInterrupt(digitalPinToInterrupt(PIN_D0), pinStateChanged, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(PIN_D1), pinStateChanged, CHANGE);
+
+    // Pin for relay
+    pinMode(PIN_T, OUTPUT);
+    digitalWrite(PIN_T, LOW);
+    // Pin for button
+    pinMode(PIN_BUTT, INPUT_PULLUP);
+    if (mac[3] == 0xFF)
+        if (mac[4] == 0xFF)
+            if (mac[5] == 0xFF)
+                printData("IT'S TEST LOCK MAC\n", 1);
+    if (lockID == "ffffffff-ffff-ffff-ffff-ffffffffffff")
+        printData("IT'S TEST LOCK ID\n", 1);
+    if (remoteServer == "172.18.198.34")
+        printData("IT'S TEST SERVER IP\n", 1);
+    testConnection2Server();
+    sendLockID2Server();
+    // Sends the initial pin state to the Wiegand library
+    pinStateChanged();
+    printData("Initialization completed!\n", 1);
+}
+
+/*
+* @brief Main loop function
+*
+* Test connction to backend server;
+* Check for pending messages on wiegand reader;
+* Read message from backend server;
+* Check if button is pressed;
+* Update lock state;
+* Send echo message to backend server;
+*
+* @return none
+*/
+void loop() {
+    reopenLog();
+
+    // Wiegand
+    noInterrupts();
+    wiegand.flush();
+    interrupts();
+
+    readMessage();
+
+    // Reading door button and changing modes
+    buttonProcessing();
+
+    // Timeout lock close after 3 seconds
+    updateLock();
+
+    if (counter == ECHO_DELAY) {
+        counter = 0;
+        testConnection2Server();
+        sendEcho2Server();
+    }
+    ++counter;
+    monitor_MQTT();
+    
+}
+
+/*
+* @brief Function which is called when wiegand data pins changed
+*
+* When any of the pins have changed, update the state of the wiegand library
+*
+* @return none
+*/
+void pinStateChanged() {
+    wiegand.setPin0State(digitalRead(PIN_D0));
+    wiegand.setPin1State(digitalRead(PIN_D1));
+}
+
+/*
+* @brief Function which is called when wiegand reader state is changed
+*
+* Notifies when a reader has been connected or disconnected.
+* Instead of a message, the seconds parameter can be anything you want -- Whatever you specify on `wiegand.onStateChange()`
+*
+* @param plugged - bool from wiegand lib
+* @param message - that you set in wiegand.onStateChange()
+*
+* @return none
+*/
+void stateChanged(bool plugged, const char* message) {
+    printData(message, 1);
+    printData(plugged ? "CONNECTED" : "DISCONNECTED", 1);
+    printData("\n", 1);
+}
+
+/*
+* @brief Check if given string is master card
+*
+* Check if given pass ID is in master card array
+
+* @param rez - string with pass ID
+*
+* @return True if is a master card, else False
+*/
+bool checkMasterCard(char*const rez) {
+    for(int i = 0; i < cardSize; ++i)
+        if (strcmp(rez, mastercards[i]) == 0)
+            return true;
+    return false;
+}
+
+/*
+* @brief Function which is called when data recieved from wiegand reader
+*
+* Notifies when a card or button was read.
+* Instead of a message, the seconds parameter can be anything you want -- Whatever you specify on `wiegand.onReceive()`
+* Convert bits to string;
+* If it's button data, then check for reset button, then check sequence length, then check for master sequence, then send request to backend server;
+* If it's card data, then check for master card, then send request to backend server;
+*
+* @param data - from wiegand lib
+* @param bits - from wiegand lib
+* @param message - that you set in wiegand.onStateChange()
+*
+* @return none
+*/
+void receivedData(uint8_t* data, uint8_t bits, const char* message) {
+    printData(message, 1);
+    char str[30];
+    char rez[6];
+    access = 0;
+
+    // Convert from byte to String
+    int j = 0;
+    uint8_t bytes = (bits + 7) / 8;
+    for (int i = 0; i < bytes; i++) {
+        sprintf(str, "%X", data[i] >> 4);
+        rez[j++] = str[0];
+        sprintf(str, "%X", data[i] & 0xF);
+        rez[j++] = str[0];
+    }
+    if (int(rez[2]) == 19) {
+        printData("---NUMPAD---");
+        if (keyCounter < KEYCOUNT)
+            keySequence[keyCounter++] = rez[1];
+        if (rez[1] == 'B')
+            keyCounter = 0;
+        if (keyCounter == KEYCOUNT) {
+            keyCounter = 0;
+            keySequence[KEYCOUNT] = '\0';
+            printData("[", 1);
+            printData(keySequence, 1);
+            printData("]\n", 1);
+            if (strcmp(keySequence,masterKeySequence) == 0) {
+                printData("This key sequence is a master-key sequence.\n", 1);
+                access = 1;
+            } else {
+                printData("This key sequence is NOT a master-key sequence, trying to contact a server...\n", 1);
+                testConnection2Server();
+                if (connection_status) {    // If connected to a server
+                    // Send GET request
+                    printData("We connected\n");
+                    client.print("GET /lock-api/v");
+                    client.print(versionAPI);
+                    client.print("/check-access/");
+                    client.print("?format=json&lock=");
+
+                    // Get hash of lock ID
+                    Sha1.init();
+                    printData("Lock ID: [", 1);
+                    printData(lockID, 1);
+                    printData("]\n", 1);
+                    Sha1.print(lockID);
+                    uint8_t* hash = Sha1.result();
+                    char hashStr[40];
+                    int k = 0;
+                    for (int i = 0; i < 20; i++) {
+                        sprintf(str, "%X", hash[i] >> 4);
+                        hashStr[k++] = str[0];
+                        sprintf(str, "%X", hash[i] & 0xF);
+                        hashStr[k++] = str[0];
+                    }
+                    hashStr[40] = '\0';
+                    printData("Hash of lock: [");
+                    printData(hashStr);
+                    printData("]\n");
+                    client.print(hashStr);
+                    client.print("&key=");
+
+                    // Get hash of key sequence
+                    Sha1.init();
+                    Sha1.print(keySequence);
+                    hash = Sha1.result();
+                    k = 0;
+                    for (int i = 0; i < 20; i++) {
+                        sprintf(str, "%X", hash[i] >> 4);
+                        hashStr[k++] = str[0];
+                        sprintf(str, "%X", hash[i] & 0xF);
+                        hashStr[k++] = str[0];
+                    }
+                    hashStr[40] = '\0';
+                    printData("Hash of key sequence: [");
+                    printData(hashStr);
+                    printData("]\n");
+                    client.print(hashStr);
+                    client.println(" HTTP/1.1");
+                    client.print("Host: ");
+                    client.println(remoteServer);
+                    client.println("Accept: */*");
+                    client.println();
+                    printData("We sent our stuff\n");
+
+                    //Waiting for response
+                    printData("Waiting for response", 1);
+                    bool gotcha = 0;
+                    int i = 0;
+                    char buff = 'X';
+                    for (i = 0; i < 1000 && !gotcha ; i++) {
+                        delay(100);
+                        gotcha = client.available();
+                        printData(".", 1);
+                        if (i == 999)
+                            printData("Connection timeout", 1);
+                    }
+                    printData("\n");
+                    printData("Answer returned after ");
+                    printData(i);
+                    printData(" ms\n");
+                    printData("Start listening, is available:");
+                    printData(client.available());
+                    printData("\n");
+                    printData("Incoming message:");
+
+                    // Reading answer
+                    while (client.available()) {
+                        char c = client.read();
+                        printData(c, 1);
+                        if (c == '*') {
+                            buff = c;
+                            printData("Found *\n");
+                        }
+                        if (c == '#') {
+                            buff = c;
+                            printData("Found #\n");
+                        }
+                    }
+                    printData("\n", 1);
+                    printData("End of reading\n");
+                    client.stop();
+                    client.flush();
+                    printData("We finished\n");
+                    printData("Access analysis\n");
+                    if (buff == '#')
+                        access = 1;
+                    else
+                        access = 0;
+                }
+            }
+        }
+    } else {
+        rez[6] = '\0';  // String terminator
+        printData("[", 1);
+        printData(rez, 1);
+        printData("]\n", 1);
+
+        // Check given and converted pass ID
+        if (checkMasterCard(rez)) {
+            printData("This card is a master-card.\n", 1);
+            access = 1;
+        } else {
+            printData("This card is NOT a master-card, trying to contact a server...\n", 1);
+            testConnection2Server();
+            if (connection_status) {    // If connected to a server
+                // Send GET request
+                printData("We connected\n");
+                client.print("GET /lock-api/v");
+                client.print(versionAPI);
+                client.print("/check-access/");
+                client.print("?format=json&lock=");
+
+                // Get hash of lock ID
+                Sha1.init();
+                printData("Lock ID: [", 1);
+                printData(lockID, 1);
+                printData("]\n", 1);
+                Sha1.print(lockID);
+                uint8_t* hash = Sha1.result();
+                char hashStr[40];
+                int k = 0;
+                for (int i = 0; i < 20; i++) {
+                    sprintf(str, "%X", hash[i] >> 4);
+                    hashStr[k++] = str[0];
+                    sprintf(str, "%X", hash[i] & 0xF);
+                    hashStr[k++] = str[0];
+                }
+                hashStr[40] = '\0';
+                printData("Hash of lock: [");
+                printData(hashStr);
+                printData("]\n");
+                client.print(hashStr);
+                client.print("&pass=");
+
+                // Get hash of pass ID
+                Sha1.init();
+                Sha1.print(rez);
+                hash = Sha1.result();
+                k = 0;
+                for (int i = 0; i < 20; i++) {
+                    sprintf(str, "%X", hash[i] >> 4);
+                    hashStr[k++] = str[0];
+                    sprintf(str, "%X", hash[i] & 0xF);
+                    hashStr[k++] = str[0];
+                }
+                hashStr[40] = '\0';
+                printData("Hash of card: [");
+                printData(hashStr);
+                printData("]\n");
+                client.print(hashStr);
+                client.println(" HTTP/1.1");
+                client.print("Host: ");
+                client.println(remoteServer);
+                client.println("Accept: */*");
+                client.println();
+                printData("We sent our stuff\n");
+
+                //Waiting for response
+                printData("Waiting for response", 1);
+                bool gotcha = 0;
+                int i = 0;
+                char buff = 'X';
+                for (i = 0; i < 1000 && !gotcha ; i++) {
+                    delay(100);
+                    gotcha = client.available();
+                    printData(".", 1);
+                    if (i == 999)
+                        printData("Connection timeout\n", 1);
+                }
+                printData("\n");
+                printData("Answer returned after ");
+                printData(i);
+                printData(" ms\n");
+                printData("Start listening, is available:");
+                printData(client.available());
+                printData("\n");
+                printData("Incoming message:\n");
+
+                // Reading answer
+                while (client.available()) {
+                    char c = client.read();
+                    printData(c, 1);
+                    if (c == '*') {
+                        buff = c;
+                        printData("Found *\n");
+                    }
+                    if (c == '#') {
+                        buff = c;
+                        printData("Found #\n");
+                    }
+                }
+                printData("\n", 1);
+                printData("End of reading\n");
+                client.stop();
+                client.flush();
+                printData("We finished\n");
+                printData("Access analysis\n");
+                if (buff == '#')
+                    access = 1;
+                else
+                    access = 0;
+            }
+        }
+    }
+    if (access == 1) {  // Opening lock if access granted
+        printData("ACCESS GRANTED\n", 1);
+        openLock();
+    } else
+        printData("ACCESS DENIED\n", 1);
+}
